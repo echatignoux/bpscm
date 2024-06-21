@@ -1,0 +1,314 @@
+##-----------------
+##  PREP_DATA  
+##-----------------
+## Created: 03 may 2024
+##-----------------
+### Commentary:
+##'
+##' Preparation of data for stan fit
+##' 
+##-----------------
+
+##' Scale Q matrix for bym2
+##'
+##' Take a shape object, and turn it to an adgency matrix,
+##' with scaling factor to be used in BYM2 formuation 
+##' 
+##' @param shape : shapefile
+##' @return A named list of class scale_geo with
+##' * scales : scaling factors for each connected subgraphs
+##' * adj_mat : adjency matrix
+##' * dt_comp : tibble of identifiers of geographical area and the subgraph they belong to
+##' 
+##' @author 
+scale_shap <- function( shape ){
+  nb<-spdep::poly2nb(shape)
+  comps_nb <- spdep::n.comp.nb(nb)
+  
+  ## Reorder the graph into sub-groups of connected graphs
+  dt_comp <- tibble(comp=comps_nb$comp.id,geo=shape$geo)%>%
+    group_by(comp)%>%
+    mutate(n=n())%>%
+    ungroup() %>%
+    mutate(id_geo = row_number())
+  
+  adj_mat <- spdep::nb2mat(nb,style="B", zero.policy = TRUE)%>%
+    (Matrix::Matrix)
+  
+  scales<-tibble(comp=1:comps_nb$nc)%>%
+    mutate(scales=map_dbl(comp,function(comp){
+      if (sum(dt_comp$comp==comp)>1){
+        adj_comp <- adj_mat[dt_comp$comp == comp , dt_comp$comp == comp]
+        Q <- Matrix::Diagonal(x=Matrix::rowSums(adj_comp)) - adj_comp
+        if (require("INLA")){
+          Q_pert = Q + max(diag(Q)) * sqrt(.Machine$double.eps)
+          Q_inv = inla.qinv(Q_pert, constr=list(A = matrix(1,1,ncol(Q_pert)),e=0))
+          sc <- exp(mean(log(diag(Q_inv))))
+        } else {
+          rg<-(ncol(Q)-1)
+          Q<-RSpectra::eigs_sym(Q, k= rg)
+          sc <- (Q$vectors %*% Diagonal(x=1/(Q$values))%*%t(Q$vectors)) %>%
+            diag(.) %>%
+            log() %>%
+            mean() %>%
+            exp()
+        }
+      } else {
+        sc <- 1
+      }
+      sc
+    }))
+  
+  ret <- list(scales=scales,
+              dt_comp=dt_comp,
+              adj_mat = adj_mat
+  )
+  class(ret) <- "scale_geo"
+  ret
+}
+
+
+##' List of edges
+##'
+##' List the edges in a scale_geo
+##' 
+##' @param scales_geo : a list created with [scale_geo]
+##' @return A tibble of connected nodes nodes1, nodes2
+##' @author 
+edges <- function( scales_geo ){
+  ## Graph as node pairs
+  nod_pairs<-scales_geo$adj_mat%>%
+    as.matrix%>%
+    as_tibble%>%
+    mutate(id=row_number())%>%
+    gather(var,val,-id)%>%
+    filter(val>0)%>%
+    mutate(id2=as.numeric(str_remove(var,"V")))%>%
+    arrange(id)%>%
+    select(id,id2)%>%
+    filter(id<id2)%>%
+    rename(nodes1=id,nodes2=id2)
+  
+  nod_pairs%>%
+    left_join(scales_geo$dt_comp%>%rename(nodes1 = id_geo,geo1=geo), by="nodes1")%>%
+    left_join(scales_geo$dt_comp%>%rename(nodes2 = id_geo,geo2=geo),by=c("nodes2","comp","n"))%>%
+    select(comp,n,nodes1,nodes2,geo1,geo2) 
+}
+
+##' Prepare geo components for stan
+##'
+##' Turn a scales_geo into a list of elements needed
+##' for ICAR and BYM2 in stan
+##' 
+##' @param scales_geo : a list created with [scale_geo]
+##' @return A named list of class "geo_stan" with the data needed to fit CAR models in stan 
+##' @author 
+prep_geo <- function( scales_geo ){
+  nodes <- edges(scales_geo)
+  n_geo <- scales_geo$dt_comp %>% nrow
+  n_comp <- scales_geo$scales$comp %>% max
+  comp_idx <-
+    scales_geo$dt_comp %>% 
+    arrange(comp)%$%id_geo
+  comp_size <- scales_geo$dt_comp %>% 
+    group_by(comp) %>%
+    summarise(n=n())%$%n
+  
+  ret<-list(
+    n_geo = n_geo,
+    n_comp = n_comp,
+    comp_size = array(comp_size, dim = n_comp), 
+    n_edges = nrow(nodes), 
+    node1 = nodes$nodes1, 
+    node2 = nodes$nodes2, 
+    comp_idx = array(comp_idx, dim = n_geo),
+    scales = scales_geo$scales$scales %>% as.array,
+    id_geo=scales_geo$dt_comp %>% select(geo,id_geo))
+  class(ret) <- "geo_stan"
+  ret
+}
+
+
+##' Extract components from the formula 
+##'
+##' @title  get_comp
+##' @param form : a formulae
+##' @return A tibble that contains the compoennet of the formulae.
+##' @details This is an internal function intended to be used in prep_data
+##' @author 
+get_comp <- function(form){
+  
+  rhs<-labels(terms(form))%>%as_tibble() %>%
+    rename(call=value)
+  rhs %<>%
+    mutate(type =
+             case_when(
+               str_detect(call,"^s\\(") & !(str_detect(call,"bym|icar|iid"))~"spline",
+               str_detect(call,"bym|icar|iid")~"re",
+               TRUE ~ "fixe"
+             )) %>%
+    mutate(prox =
+             case_when(
+               str_detect(call,"X1")~"X1",
+               str_detect(call,"X2")~"X2",
+               str_detect(call,"X3")~"X3",
+               TRUE ~ "All"
+             )) %>%
+    mutate(value =
+             case_when(
+               str_detect(call,"bym")~3,
+               str_detect(call,"iid")~1,
+               str_detect(call,"icar")~2,
+               type=="spline" ~ 1,
+               TRUE ~ 0
+             )) 
+    
+  re_comp <-   
+    tibble(type="re", prox = c("X1","X2","X3")) %>%
+    left_join(rhs, by=c("type","prox"))
+  def_re <- rhs %>% filter(type=="re", prox=="All")%$%value 
+  if (length(def_re)==0) def_re <- 0
+    re_comp %<>% mutate(value = replace_na(value, def_re))
+
+  rhs %>%
+    filter(type=="spline") %>%
+    bind_rows(re_comp)
+  
+}
+
+
+##' Prepare data to be used in stan fit
+##'
+##' @param geo : geographical info (sf, scale_geo or geo_stan object)
+##' @param dt : data frame with geo 
+##' @param form : formula
+##' @return A list of data suited to stan sampling
+##' @author 
+prep_data <- function(dt,
+                      geo = NULL,
+                      form = inc(Y, prox) ~ offset(log(pa)) +
+                        s(age,bs="cr",k=5) + s(geo, bs = "bym") + shared(s(geo, bs = "bym"))){
+  
+  ## Prep geography
+  ## geo in dt
+  if (is.null(geo))
+    geo <- dt %>% select(geo,geometry) %>% unique()
+  ## If geo is not a geo_stan, turn it to
+  if (is.null(geo)){
+    n_geo = length(unique(dt$geo))
+    geo <- list(n_geo = n_geo,
+                n_comp=1,
+                comp_size = n_geo %>% as.array,
+                n_edges = 1,
+                node1 = 1%>% as.array,
+                node2 = 2%>% as.array,
+                comp_idx = 1:n_geo%>% as.array,
+                scales = 1 %>% as.array,
+                id_geo = dt %>%
+                  ungroup() %>%
+                  select(geo) %>%
+                  unique() %>%
+                  mutate(id_geo = row_number())
+    )
+  }
+  if (any(class(geo)=="sf")){
+    geo <- prep_geo(scale_shap(geo))
+  }
+  if (class(geo)=="scale_geo"){
+    geo <- prep_geo(geo)
+  }
+  
+  ## Prep incidence
+  ## Add age = 1 if no age variable in the data
+  if (!any(str_detect(names(dt),"age")))
+    dt$age<-1
+  ## Select columns involved in the model
+  vars <- setdiff(all.vars(form),c("X1","X2","X3"))
+  dt %<>%
+    ungroup() %>% 
+    select(c(vars,"age","geo") %>% unique)
+  
+  ## Arrange by geo,age for each prox 
+  dt %<>%
+    as_tibble %>%
+    left_join(geo$id_geo, by="geo") %>%
+    group_by(prox)%>%
+    arrange(id_geo,age) %>%
+    ungroup()
+  
+  ## Assign offsets
+  off<-terms(form) %>% attr(.,"offset")
+  if (is.null(off)){
+    dt[,"off"]<-1
+  }  else{
+    name_off <- all.vars(form[-2])[off-1]
+    off<-attributes(terms(form))$variable %>% as.character %>% .[off+1]
+    off <- model.frame( as.formula(str_glue("~{f}",f=off)), data=dt)
+    dt[,"off"]<-off
+    dt %<>% select(-any_of(name_off))
+  }
+  
+  ## Incidence data
+  inc<-all.vars(form[[2]])
+  
+  ## Split incidnce and offset into columns defined by by 
+  n_dis<-1
+  if (length(inc)>1){
+    n_dis <- length(unique(dt[,inc[2]] %>% unlist))
+    dt %<>%
+      mutate_at(vars(inc[2]),~as.numeric(as.factor(.x) %>% droplevels)) %>%
+      pivot_wider(names_from = inc[2], values_from = c("off",inc[1]), names_sep = "")
+    inc <- paste0(inc[1],1:n_dis)
+    off <- paste0("off",1:n_dis)
+  } else {
+    inc <- inc[1]
+    off <- "off"
+  }
+  
+  ## Response data and offset
+  dt %<>% mutate(id_data=row_number())
+  dt_model<-
+    list(
+      n_dis = n_dis,
+      n_obs = nrow(dt),
+      n_age = length(unique(dt$age)),
+      id_age = dt%>%group_by(age)%>%slice(1)%$%id_data,
+      inc = dt %>%
+        select_at(inc) %>% as.matrix,
+      off = dt %>% select(all_of(off)) %>%as.matrix,
+      id_data=dt$id_data
+    )
+  
+  # Get other components of the formula
+  comp<-get_comp(form) %>%
+    arrange(prox)
+  
+  ## Splines
+  spl<-list()
+  if ("spline" %in% comp$type){
+    bs <- comp %>% filter(type=="spline")%$%call
+    ## Turn into t2
+    bs %<>% str_replace("s\\(","t2\\(")
+    bs <- mgcv:::smoothCon(eval(parse(text=bs)),data=dt)[[1]]
+    bs <- mgcv:::smooth2random(bs,"",2)
+    Z = cbind(bs$Xf[,2],bs$rand[[1]]) 
+    spl <- list(Z = Z,
+                d_z = ncol(Z))
+  }
+  
+  dt_model$prior_only<-0
+  geo$id_geo <- dt$id_geo
+  
+  ## Output
+  c(dt_model,
+    geo,
+    spl,
+    comp%>% filter(type=="re") %>% select(re_typ = value) %>% as.list,
+    list(id_dt=dt %>% select(geo,age,id_data,id_geo)),
+    form=form
+  )
+  
+}
+
+
+## prep_data.R ends here

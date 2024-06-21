@@ -1,0 +1,9 @@
+inst/doc
+README_cache
+data-raw
+.Rhistory
+graph
+/README.Rmd~
+/graph.inla
+/stan/bp_scm_age.rds
+*.rds
